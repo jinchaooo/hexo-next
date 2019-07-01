@@ -1,0 +1,36 @@
+---
+title: 同态加密之CKKS方案
+date: 2019-02-18 14:47:42
+tags: FHE
+categories: 算法和研究
+---
+继上一篇日志介绍微软的同态加密库SEAL实现的BFV方案，这一篇日志介绍SEAL实现的另一种方案，即CKKS方案。与BFV方案相比，CKKS方案最大的优势是能直接对双精度浮点类型的实数甚至复数进行编码，加密和运算。在BFV方案下，如果要使用BatchEncoder处理浮点数，需要先将浮点数乘以一个放大倍数后再round up成整数，然后再编码成明文多项式。每次乘法运算后会导致倍数逐渐放大，需要应用程序自己记录和管理。然而，这里有个比较严重的问题是，在BFV的密文下，无法直接将放大的倍数缩小，导致放大倍数快速累积膨胀而超出明文多项式系数的模（同时也是编码进多项式的整数的模）而发生wrap around。如上篇日志所述，虽说这一问题可以通过CRT方法暂时解决，但这不是一个通用的方法，并且会成倍增加计算复杂度。CKKS的强大之处在于，它提供了一个密文的rescale操作，可以方便的将密文的放大倍数缩小，从而避免了放大倍数在计算过程中一直膨胀而带来的问题。
+<!--more-->
+
+## CKKS方案的参数
+
+与BFV相比，CKKS方案的加密参数的一个最大不同就是没有plain_modulus。其主要的参数设置poly_modulus_degree和coeff_modulus与BFV方案的设置类似。CKKS的明文多项式系数以coeff_modulus为模，这一点与BFV不同。另外，CKKS的明文和密文都携带当前所用参数组的parm_id，而BFV只有密文携带parm_id。
+
+## CKKS方案的数据编码
+
+SEAL中实现的CKKS编码器为CKKSEncoder，它在操作上类似BFV的BatchEncoder，但背后的数学原理不同。CKKSEncoder将一个含有（poly_modulus_degree / 2）个元素的数组编码进明文多项式，其中每个元素可以为实数或复数。<br>CKKSEncoder需要提供一个额外的参数：scale，其意义为将实数或复数编码进明文时的放大倍数。scale也决定了编码时以及最后计算结果的精度。另外，CKKS编码进明文多项式的数据是以coeff_modulus为模的，因此scale的取值也不能过大以致接近coeff_modulus的值。可以从CKKS的明文或密文方便的获取当前数据的scale的值。<br>CKKSEncoder也提供了接口在数据编码时指定使用参数链（modulus switching chain）上的某一组特定参数来进行编码。在对CKKS的密文进行加乘运算时需要保证双方密文的底层参数（coeff_modulus, poly_modulus_degree）一致。特别的，在进行加法运算时，还要保证双方当前scale的值一致。乘法运算不要求双方scale一致，但结果的scale是双方scale之积。
+
+## CKKS方案的模转换（modulus switching）
+
+CKKS的modulus switching与BFV类似，就是从coeff_modulus中除去一个素数因子。值得注意的是，该操作不会改变实际数据scale的大小（与下面的rescaling操作相区别），因此在进行modulus switching时一定要注意switch之后的coeff_modulus要比scale因子大并有足够的空间容纳scale后的实际数据。
+
+## CKKS方案的rescaling操作
+
+Rescaling操作是CKKS区别于BFV的一个重要操作。首先，rescaling与modulus switching类似，也是从coeff_modulus中除去一个素数因子。然后，rescaling的不同之处在于，它同时产生的效果是将当前的scale因子也除以该素数因子。前面曾提到BFV处理浮点数时最大的问题是密文中的scale因子会累积膨胀越来越大而无法减小，而CKKS可以通过rescaling降低密文的scale因子，从而有效的解决了处理浮点数时的scale问题。<br>应用程序可以直接手动修改CKKS明文或密文内部的scale。例如，直接将密文的scale乘以一个数，相当于对密文中的数据直接除以这个数（密文中的数据没变，scale变大了，那相对应表示的数据就变小了）。
+
+## CKKS方案密文中的噪音
+
+CKKS密文中的噪音不同于BFV密文的noise budget。CKKS的密文中，噪音会占据低位部分，而实际数据因为进行了scale所以存在于高位部分。数据和噪音共存而较难被完全清晰的区分。每次操作导致的噪音增长，都会让噪音从低位向高位扩展。因此，需要防止scale过低时，高位的实际数据易与低位的噪音混合而导致精度下降或数据被覆盖。
+
+## CKKS方案的再线性化操作（Relinearization）
+
+CKKS的Relinearizaiton与BFV类似。需要注意的是需要进行Relinearization和rescaling两种操作时，一定要先进行relinearization再进行rescaling，否则SEAL会抛出异常。
+
+## CKKS方案的旋转操作 （Rotation）
+
+CKKS的Rotation也与BFV类似，是对明文或密文内含slots的循环移动操作。旋转操作需要用到Galois Keys。由于Galois Keys的size比较大，因此在创建keys的时候可以根据需要只创建特定旋转步长的Keys（比如一次旋转一个slot），这样可以减少Keys的个数，以节省内存空间。<br>在需要进行Rotation和Rescaling两种操作时，理想情况下是先进行Rotation再进行Rescaling，因为Rotation（以及前面提到的Relinearizaiton）产生的噪音在大的scale下对数据精度的影响更小，并且在随后后进行的Rescaling会一定程度上将Rotation产生的噪音遮盖掉。
